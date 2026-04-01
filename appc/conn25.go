@@ -6,6 +6,7 @@ package appc
 import (
 	"cmp"
 	"slices"
+	"strings"
 
 	"tailscale.com/ipn/ipnext"
 	"tailscale.com/tailcfg"
@@ -64,10 +65,22 @@ func PickSplitDNSPeers(hasCap func(c tailcfg.NodeCapability) bool, self tailcfg.
 	if err != nil {
 		return m
 	}
-	tagToDomain := make(map[string][]string)
+
+	// We want to strip the leading *. from any domains because the
+	// OS entries treat that as literal, so *.example.com will become
+	// example.com and that will be treated as a wildcard. And we want
+	// to deduplicate the domains if the config specified both.
+	tagToDomain := make(map[string]set.Set[string])
 	for _, app := range apps {
+		domains := make(set.Set[string])
+		for _, domain := range app.Domains {
+			domains.Add(strings.ToLower(strings.TrimPrefix(domain, "*.")))
+		}
 		for _, tag := range app.Connectors {
-			tagToDomain[tag] = append(tagToDomain[tag], app.Domains...)
+			if tagToDomain[tag] == nil {
+				mak.Set(&tagToDomain, tag, set.Set[string]{})
+			}
+			tagToDomain[tag].AddSet(domains)
 		}
 	}
 	// NodeIDs are Comparable, and we have a map of NodeID to NodeView anyway, so
@@ -79,7 +92,7 @@ func PickSplitDNSPeers(hasCap func(c tailcfg.NodeCapability) bool, self tailcfg.
 		}
 		for _, t := range peer.Tags().All() {
 			domains := tagToDomain[t]
-			for _, domain := range domains {
+			for _, domain := range domains.Slice() {
 				if work[domain] == nil {
 					mak.Set(&work, domain, set.Set[tailcfg.NodeID]{})
 				}

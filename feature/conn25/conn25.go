@@ -65,7 +65,7 @@ func jsonDecode(target any, rc io.ReadCloser) error {
 func normalizeDNSName(name string) (dnsname.FQDN, error) {
 	// note that appconnector does this same thing, tsdns has its own custom lower casing
 	// it might be good to unify in a function in dnsname package.
-	return dnsname.ToFQDN(strings.ToLower(name))
+	return dnsname.ToFQDN(strings.ToLower(strings.TrimPrefix(name, "*.")))
 }
 
 func init() {
@@ -515,14 +515,19 @@ func configFromNodeView(n tailcfg.NodeView) (config, error) {
 	}
 	for _, app := range apps {
 		selfMatchesTags := slices.ContainsFunc(app.Connectors, selfTags.Contains)
+		normalizedDomains := set.Set[dnsname.FQDN]{}
 		for _, d := range app.Domains {
 			fqdn, err := normalizeDNSName(d)
 			if err != nil {
 				return config{}, err
 			}
-			mak.Set(&cfg.appNamesByDomain, fqdn, append(cfg.appNamesByDomain[fqdn], app.Name))
-			if selfMatchesTags {
-				cfg.selfRoutedDomains.Add(fqdn)
+			// After normalization there may be duplicates which we don't want
+			if !normalizedDomains.Contains(fqdn) {
+				normalizedDomains.Add(fqdn)
+				mak.Set(&cfg.appNamesByDomain, fqdn, append(cfg.appNamesByDomain[fqdn], app.Name))
+				if selfMatchesTags {
+					cfg.selfRoutedDomains.Add(fqdn)
+				}
 			}
 		}
 		mak.Set(&cfg.appsByName, app.Name, app)
@@ -618,29 +623,33 @@ func (c *client) reconfig(newCfg config) error {
 	return nil
 }
 
-func (c *client) isConnectorDomain(domain dnsname.FQDN) bool {
+// getAppsForConnectorDomain returns the set of apps which match the (sub)domain which
+// is longest suffix of the specified domain, or returns an empty slice if
+// there are no apps which match. The returned boolean is true only if there is at
+// least one app that matches, false otherwise.
+func (c *client) getAppsForConnectorDomain(domain dnsname.FQDN) ([]string, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	appNames, ok := c.config.appNamesByDomain[domain]
-	return ok && len(appNames) > 0
+	for d := domain; d != ""; d = d.Parent() {
+		if appNames, ok := c.config.appNamesByDomain[d]; ok && len(appNames) > 0 {
+			return appNames, true
+		}
+	}
+	return nil, false
 }
 
 // reserveAddresses tries to make an assignment of addrs from the address pools
 // for this domain+dst address, so that this client can use conn25 connectors.
+// The names of the matching app is also provided.
 // It checks that this domain should be routed and that this client is not itself a connector for the domain
 // and generally if it is valid to make the assignment.
-func (c *client) reserveAddresses(domain dnsname.FQDN, dst netip.Addr) (addrs, error) {
+func (c *client) reserveAddresses(domain dnsname.FQDN, dst netip.Addr, appName string) (addrs, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if existing, ok := c.assignments.lookupByDomainDst(domain, dst); ok {
 		return existing, nil
 	}
-	appNames, _ := c.config.appNamesByDomain[domain]
-	if len(appNames) == 0 {
-		return addrs{}, fmt.Errorf("no app names found for domain %q", domain)
-	}
 	// only reserve for first app
-	app := appNames[0]
 	mip, err := c.magicIPPool.next()
 	if err != nil {
 		return addrs{}, err
@@ -653,7 +662,7 @@ func (c *client) reserveAddresses(domain dnsname.FQDN, dst netip.Addr) (addrs, e
 		dst:     dst,
 		magic:   mip,
 		transit: tip,
-		app:     app,
+		app:     appName,
 		domain:  domain,
 	}
 	if err := c.assignments.insert(as); err != nil {
@@ -846,9 +855,12 @@ func (c *client) mapDNSResponse(buf []byte) []byte {
 	if err != nil {
 		return buf
 	}
-	if !c.isConnectorDomain(queriedDomain) {
+	appNames, ok := c.getAppsForConnectorDomain(queriedDomain)
+	if !ok {
 		return buf
 	}
+	// There is guaranteed to be at least one matching app, so just take the first one for now
+	appName := appNames[0]
 
 	// Now we know this is a dns response we think we should rewrite, we're going to provide our response which
 	// currently means we will:
@@ -859,7 +871,7 @@ func (c *client) mapDNSResponse(buf []byte) []byte {
 	if question.Type != dnsmessage.TypeA {
 		// we plan to support TypeAAAA soon (2026-03-11)
 		c.logf("mapping dns response for connector domain, unsupported type: %v", question.Type)
-		newBuf, err := c.rewriteDNSResponse(hdr, questions, answers)
+		newBuf, err := c.rewriteDNSResponse(hdr, questions, answers, appName)
 		if err != nil {
 			c.logf("error writing empty response for unsupported type: %v", err)
 			return makeServFail(c.logf, hdr, question)
@@ -925,7 +937,7 @@ func (c *client) mapDNSResponse(buf []byte) []byte {
 			}
 		}
 	}
-	newBuf, err := c.rewriteDNSResponse(hdr, questions, answers)
+	newBuf, err := c.rewriteDNSResponse(hdr, questions, answers, appName)
 	if err != nil {
 		c.logf("error rewriting dns response: %v", err)
 		return makeServFail(c.logf, hdr, question)
@@ -933,7 +945,7 @@ func (c *client) mapDNSResponse(buf []byte) []byte {
 	return newBuf
 }
 
-func (c *client) rewriteDNSResponse(hdr dnsmessage.Header, questions []dnsmessage.Question, answers []dnsResponseRewrite) ([]byte, error) {
+func (c *client) rewriteDNSResponse(hdr dnsmessage.Header, questions []dnsmessage.Question, answers []dnsResponseRewrite, appName string) ([]byte, error) {
 	// We are currently (2026-03-10) only doing this for AResource records, we know that if we are here
 	// with non-empty answers, the type was AResource.
 	b := dnsmessage.NewBuilder(nil, hdr)
@@ -952,7 +964,7 @@ func (c *client) rewriteDNSResponse(hdr dnsmessage.Header, questions []dnsmessag
 
 	// make an answer for each rewrite
 	for _, rw := range answers {
-		as, err := c.reserveAddresses(rw.domain, rw.dst)
+		as, err := c.reserveAddresses(rw.domain, rw.dst, appName)
 		if err != nil {
 			return nil, err
 		}

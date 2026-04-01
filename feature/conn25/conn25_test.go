@@ -392,12 +392,13 @@ func TestReserveIPs(t *testing.T) {
 	c := newConn25(logger.Discard)
 	c.client.magicIPPool = newIPPool(mustIPSetFromPrefix("100.64.0.0/24"))
 	c.client.transitIPPool = newIPPool(mustIPSetFromPrefix("169.254.0.0/24"))
+	const appName = "a"
 	mbd := map[dnsname.FQDN][]string{}
-	mbd["example.com."] = []string{"a"}
+	mbd["example.com."] = []string{appName}
 	c.client.config.appNamesByDomain = mbd
 
 	dst := netip.MustParseAddr("0.0.0.1")
-	addrs, err := c.client.reserveAddresses("example.com.", dst)
+	addrs, err := c.client.reserveAddresses("example.com.", dst, appName)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -405,7 +406,7 @@ func TestReserveIPs(t *testing.T) {
 	wantDst := netip.MustParseAddr("0.0.0.1")         // same as dst we pass in
 	wantMagic := netip.MustParseAddr("100.64.0.0")    // first from magic pool
 	wantTransit := netip.MustParseAddr("169.254.0.0") // first from transit pool
-	wantApp := "a"                                    // the app name related to example.com.
+	wantApp := appName                                // the app name related to example.com.
 	wantDomain := must.Get(dnsname.ToFQDN("example.com."))
 
 	if wantDst != addrs.dst {
@@ -496,6 +497,19 @@ func TestConfigReconfig(t *testing.T) {
 			},
 			wantSelfRoutedDomains: set.SetOf([]dnsname.FQDN{"1.a.example.com.", "1.b.example.com.", "4.b.example.com.", "4.d.example.com."}),
 		},
+		{
+			name: "wildcard-collapse-and-deduplication",
+			cfg: []appctype.Conn25Attr{
+				{Name: "one", Domains: []string{"*.example.com"}, Connectors: []string{"tag:one"}},
+				{Name: "two", Domains: []string{"example.com", "sub.example.com"}, Connectors: []string{"tag:two"}},
+			},
+			tags: []string{"tag:one", "tag:two"},
+			wantAppsByDomain: map[dnsname.FQDN][]string{
+				"example.com.":     {"one", "two"},
+				"sub.example.com.": {"two"},
+			},
+			wantSelfRoutedDomains: set.SetOf([]dnsname.FQDN{"example.com.", "sub.example.com."}),
+		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			cfg := []tailcfg.RawMessage{tailcfg.RawMessage(tt.rawCfg)}
@@ -525,6 +539,46 @@ func TestConfigReconfig(t *testing.T) {
 			}
 			if diff := cmp.Diff(tt.wantSelfRoutedDomains, c.selfRoutedDomains); diff != "" {
 				t.Errorf("selfRoutedDomains diff (-want, +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestGetAppsForDomainName(t *testing.T) {
+	sn := makeSelfNode(
+		t,
+		[]appctype.Conn25Attr{
+			{Name: "one", Domains: []string{"*.example.com", "example.com"}, Connectors: []string{"tag:one"}},
+			{Name: "two", Domains: []string{"sub.example.com", "example.com"}, Connectors: []string{"tag:two"}},
+			{Name: "three", Domains: []string{"sub.example.com"}, Connectors: []string{"tag:three"}},
+			{Name: "four", Domains: []string{"a.sub.example.com"}, Connectors: []string{"tag:four"}},
+		},
+		[]string{"one", "two", "three", "four"},
+	)
+
+	for _, tt := range []struct {
+		name     string
+		domain   dnsname.FQDN
+		wantOk   bool
+		wantApps []string
+	}{
+		{name: "no-match", domain: "nomatch.com.", wantOk: false, wantApps: nil},
+		{name: "exact-match", domain: "example.com.", wantOk: true, wantApps: []string{"one", "two"}},
+		{name: "wildcard-subdomain-match", domain: "a.example.com.", wantOk: true, wantApps: []string{"one", "two"}},
+		{name: "exact-subdomain-match", domain: "sub.example.com.", wantOk: true, wantApps: []string{"two", "three"}},
+		{name: "wildcard-sub-of-subdomain-match", domain: "b.sub.example.com.", wantOk: true, wantApps: []string{"two", "three"}},
+		{name: "exact-sub-of-subdomain-match", domain: "a.sub.example.com.", wantOk: true, wantApps: []string{"four"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			c := newConn25(logger.Discard)
+			c.reconfig(sn)
+
+			gotApps, gotOk := c.client.getAppsForConnectorDomain(tt.domain)
+			if gotOk != tt.wantOk {
+				t.Errorf("unexpected ok result, want %v, got %v", tt.wantOk, gotOk)
+			}
+			if diff := cmp.Diff(tt.wantApps, gotApps); diff != "" {
+				t.Errorf("unexpected appNames result: diff (-want, +got):\n%s", diff)
 			}
 		})
 	}
@@ -681,14 +735,16 @@ func makeDNSResponseForSections(t *testing.T, questions []dnsmessage.Question, a
 func TestMapDNSResponseAssignsAddrs(t *testing.T) {
 	for _, tt := range []struct {
 		name          string
+		appDomains    []string
 		domain        string
 		addrs         []*dnsmessage.AResource
 		wantByMagicIP map[netip.Addr]addrs
 	}{
 		{
-			name:   "one-ip-matches",
-			domain: "example.com.",
-			addrs:  []*dnsmessage.AResource{{A: [4]byte{1, 0, 0, 0}}},
+			name:       "one-ip-matches",
+			appDomains: []string{"example.com"},
+			domain:     "example.com.",
+			addrs:      []*dnsmessage.AResource{{A: [4]byte{1, 0, 0, 0}}},
 			// these are 'expected' because they are the beginning of the provided pools
 			wantByMagicIP: map[netip.Addr]addrs{
 				netip.MustParseAddr("100.64.0.0"): {
@@ -701,8 +757,9 @@ func TestMapDNSResponseAssignsAddrs(t *testing.T) {
 			},
 		},
 		{
-			name:   "multiple-ip-matches",
-			domain: "example.com.",
+			name:       "multiple-ip-matches",
+			appDomains: []string{"example.com"},
+			domain:     "example.com.",
 			addrs: []*dnsmessage.AResource{
 				{A: [4]byte{1, 0, 0, 0}},
 				{A: [4]byte{2, 0, 0, 0}},
@@ -725,11 +782,92 @@ func TestMapDNSResponseAssignsAddrs(t *testing.T) {
 			},
 		},
 		{
-			name:   "no-domain-match",
-			domain: "x.example.com.",
+			name:       "no-domain-match",
+			appDomains: []string{"foo.example.com"},
+			domain:     "bad.example.com.",
 			addrs: []*dnsmessage.AResource{
 				{A: [4]byte{1, 0, 0, 0}},
 				{A: [4]byte{2, 0, 0, 0}},
+			},
+		},
+		{
+			name:       "subdomain-matches",
+			appDomains: []string{"example.com"},
+			domain:     "sub.example.com.",
+			addrs:      []*dnsmessage.AResource{{A: [4]byte{1, 0, 0, 0}}},
+			// these are 'expected' because they are the beginning of the provided pools
+			wantByMagicIP: map[netip.Addr]addrs{
+				netip.MustParseAddr("100.64.0.0"): {
+					domain:  "sub.example.com.",
+					dst:     netip.MustParseAddr("1.0.0.0"),
+					magic:   netip.MustParseAddr("100.64.0.0"),
+					transit: netip.MustParseAddr("100.64.0.40"),
+					app:     "app1",
+				},
+			},
+		},
+		{
+			name:       "exact-subdomain-matches",
+			appDomains: []string{"example.com", "sub.example.com"},
+			domain:     "sub.example.com.",
+			addrs:      []*dnsmessage.AResource{{A: [4]byte{1, 0, 0, 0}}},
+			// these are 'expected' because they are the beginning of the provided pools
+			wantByMagicIP: map[netip.Addr]addrs{
+				netip.MustParseAddr("100.64.0.0"): {
+					domain:  "sub.example.com.",
+					dst:     netip.MustParseAddr("1.0.0.0"),
+					magic:   netip.MustParseAddr("100.64.0.0"),
+					transit: netip.MustParseAddr("100.64.0.40"),
+					app:     "app1",
+				},
+			},
+		},
+		{
+			name:       "wildcard-subdomain-matches-subdomain",
+			appDomains: []string{"*.example.com", "*.sub.example.com"},
+			domain:     "a.sub.example.com.",
+			addrs:      []*dnsmessage.AResource{{A: [4]byte{1, 0, 0, 0}}},
+			// these are 'expected' because they are the beginning of the provided pools
+			wantByMagicIP: map[netip.Addr]addrs{
+				netip.MustParseAddr("100.64.0.0"): {
+					domain:  "a.sub.example.com.",
+					dst:     netip.MustParseAddr("1.0.0.0"),
+					magic:   netip.MustParseAddr("100.64.0.0"),
+					transit: netip.MustParseAddr("100.64.0.40"),
+					app:     "app1",
+				},
+			},
+		},
+		{
+			name:       "exact-domain-does-not-match-specific-subdomain",
+			appDomains: []string{"example.com", "sub.example.com"},
+			domain:     "example.com.",
+			addrs:      []*dnsmessage.AResource{{A: [4]byte{1, 0, 0, 0}}},
+			// these are 'expected' because they are the beginning of the provided pools
+			wantByMagicIP: map[netip.Addr]addrs{
+				netip.MustParseAddr("100.64.0.0"): {
+					domain:  "example.com.",
+					dst:     netip.MustParseAddr("1.0.0.0"),
+					magic:   netip.MustParseAddr("100.64.0.0"),
+					transit: netip.MustParseAddr("100.64.0.40"),
+					app:     "app1",
+				},
+			},
+		},
+		{
+			name:       "other-subdomain-does-not-match-subdomain",
+			appDomains: []string{"example.com", "sub.example.com"},
+			domain:     "other.example.com.",
+			addrs:      []*dnsmessage.AResource{{A: [4]byte{1, 0, 0, 0}}},
+			// these are 'expected' because they are the beginning of the provided pools
+			wantByMagicIP: map[netip.Addr]addrs{
+				netip.MustParseAddr("100.64.0.0"): {
+					domain:  "other.example.com.",
+					dst:     netip.MustParseAddr("1.0.0.0"),
+					magic:   netip.MustParseAddr("100.64.0.0"),
+					transit: netip.MustParseAddr("100.64.0.40"),
+					app:     "app1",
+				},
 			},
 		},
 	} {
@@ -738,7 +876,7 @@ func TestMapDNSResponseAssignsAddrs(t *testing.T) {
 			sn := makeSelfNode(t, []appctype.Conn25Attr{{
 				Name:          "app1",
 				Connectors:    []string{"tag:woo"},
-				Domains:       []string{"example.com"},
+				Domains:       tt.appDomains,
 				MagicIPPool:   []netipx.IPRange{rangeFrom("0", "10"), rangeFrom("20", "30")},
 				TransitIPPool: []netipx.IPRange{rangeFrom("40", "50")},
 			}}, []string{})
@@ -753,19 +891,45 @@ func TestMapDNSResponseAssignsAddrs(t *testing.T) {
 	}
 }
 
+func TestNormalizedDNSNames(t *testing.T) {
+	tests := []struct {
+		name   string
+		domain string
+	}{
+		{name: "no-change", domain: "example.com."},
+		{name: "mixed-case", domain: "eXAmPle.COM"},
+		{name: "wildcard", domain: "*.example.com"},
+		{name: "mixed-case-wildcard", domain: "*.EXAMPLE.COM"},
+	}
+
+	const expectedDomain = "example.com."
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := normalizeDNSName(tt.domain)
+			if err != nil {
+				t.Errorf("unexpected error %v", err)
+			}
+			if got != expectedDomain {
+				t.Errorf("Unexpected result, want %q, got %q", expectedDomain, got)
+			}
+		})
+	}
+}
+
 func TestReserveAddressesDeduplicated(t *testing.T) {
+	const appName = "a"
 	c := newConn25(logger.Discard)
 	c.client.magicIPPool = newIPPool(mustIPSetFromPrefix("100.64.0.0/24"))
 	c.client.transitIPPool = newIPPool(mustIPSetFromPrefix("169.254.0.0/24"))
-	c.client.config.appNamesByDomain = map[dnsname.FQDN][]string{"example.com.": {"a"}}
+	c.client.config.appNamesByDomain = map[dnsname.FQDN][]string{"example.com.": {appName}}
 
 	dst := netip.MustParseAddr("0.0.0.1")
-	first, err := c.client.reserveAddresses("example.com.", dst)
+	first, err := c.client.reserveAddresses("example.com.", dst, appName)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	second, err := c.client.reserveAddresses("example.com.", dst)
+	second, err := c.client.reserveAddresses("example.com.", dst, appName)
 	if err != nil {
 		t.Fatal(err)
 	}
