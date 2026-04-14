@@ -371,16 +371,8 @@ func (b *LocalBackend) nonInteractiveLoginForStateTest() {
 // network delays) are just ignored for now, which makes the test
 // predictable, but maybe a bit less thorough. This is more of an overall
 // state machine test than a test of the wgengine+magicsock integration.
-func TestStateMachine(t *testing.T) {
-	runTestStateMachine(t, false)
-}
-
 func TestStateMachineSeamless(t *testing.T) {
 	flakytest.Mark(t, "https://github.com/tailscale/tailscale/issues/19377")
-	runTestStateMachine(t, true)
-}
-
-func runTestStateMachine(t *testing.T, seamless bool) {
 	envknob.Setenv("TAILSCALE_USE_WIP_CODE", "1")
 	defer envknob.Setenv("TAILSCALE_USE_WIP_CODE", "")
 	c := qt.New(t)
@@ -589,12 +581,6 @@ func runTestStateMachine(t *testing.T, seamless bool) {
 	notifies.expect(3)
 	cc.persist.UserProfile.LoginName = "user1"
 	cc.persist.NodeID = "node1"
-
-	// even if seamless is being enabled by default rather than by policy, this is
-	// the point where it will first get enabled.
-	if seamless {
-		sys.ControlKnobs().SeamlessKeyRenewal.Store(true)
-	}
 
 	cc.send(sendOpt{loginFinished: true, nm: &netmap.NetworkMap{}})
 	{
@@ -1516,7 +1502,6 @@ func TestEngineReconfigOnStateChange(t *testing.T) {
 		{
 			name: "Seamless/Start/Connect/Login/InitReauth",
 			steps: func(t *testing.T, lb *LocalBackend, cc func() *mockControl) {
-				lb.ControlKnobs().SeamlessKeyRenewal.Store(true)
 				mustDo(t)(lb.Start(ipn.Options{}))
 				mustDo2(t)(lb.EditPrefs(connect))
 				cc().authenticated(node1)
@@ -1546,7 +1531,6 @@ func TestEngineReconfigOnStateChange(t *testing.T) {
 		{
 			name: "Seamless/Start/Connect/Login/InitReauth/Login",
 			steps: func(t *testing.T, lb *LocalBackend, cc func() *mockControl) {
-				lb.ControlKnobs().SeamlessKeyRenewal.Store(true)
 				mustDo(t)(lb.Start(ipn.Options{}))
 				mustDo2(t)(lb.EditPrefs(connect))
 				cc().authenticated(node1)
@@ -1578,7 +1562,6 @@ func TestEngineReconfigOnStateChange(t *testing.T) {
 		{
 			name: "Seamless/Start/Connect/Login/Expire",
 			steps: func(t *testing.T, lb *LocalBackend, cc func() *mockControl) {
-				lb.ControlKnobs().SeamlessKeyRenewal.Store(true)
 				mustDo(t)(lb.Start(ipn.Options{}))
 				mustDo2(t)(lb.EditPrefs(connect))
 				cc().authenticated(node1)
@@ -1636,15 +1619,7 @@ func TestEngineReconfigOnStateChange(t *testing.T) {
 
 // TestSendPreservesAuthURL tests that wgengine updates arriving in the middle of
 // processing an auth URL doesn't result in the auth URL being cleared.
-func TestSendPreservesAuthURL(t *testing.T) {
-	runTestSendPreservesAuthURL(t, false)
-}
-
 func TestSendPreservesAuthURLSeamless(t *testing.T) {
-	runTestSendPreservesAuthURL(t, true)
-}
-
-func runTestSendPreservesAuthURL(t *testing.T, seamless bool) {
 	var cc *mockControl
 	b := newLocalBackendWithTestControl(t, true, func(tb testing.TB, opts controlclient.Options) controlclient.Client {
 		cc = newClient(t, opts)
@@ -1662,10 +1637,6 @@ func runTestSendPreservesAuthURL(t *testing.T, seamless bool) {
 	t.Log("LoginFinished")
 	cc.persist.UserProfile.LoginName = "user1"
 	cc.persist.NodeID = "node1"
-
-	if seamless {
-		b.sys.ControlKnobs().SeamlessKeyRenewal.Store(true)
-	}
 
 	cc.send(sendOpt{loginFinished: true, nm: &netmap.NetworkMap{
 		SelfNode: (&tailcfg.Node{MachineAuthorized: true}).View(),
