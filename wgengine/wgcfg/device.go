@@ -4,9 +4,8 @@
 package wgcfg
 
 import (
-	"errors"
-	"io"
-	"sort"
+	"fmt"
+	"net/netip"
 
 	"github.com/tailscale/wireguard-go/conn"
 	"github.com/tailscale/wireguard-go/device"
@@ -21,27 +20,28 @@ func NewDevice(tunDev tun.Device, bind conn.Bind, logger *device.Logger) *device
 	return ret
 }
 
-func DeviceConfig(d *device.Device) (*Config, error) {
-	r, w := io.Pipe()
-	errc := make(chan error, 1)
-	go func() {
-		errc <- d.IpcGetOperation(w)
-		w.Close()
-	}()
-	cfg, fromErr := FromUAPI(r)
-	r.Close()
-	getErr := <-errc
-	err := errors.Join(getErr, fromErr)
-	if err != nil {
-		return nil, err
-	}
-	sort.Slice(cfg.Peers, func(i, j int) bool {
-		return cfg.Peers[i].PublicKey.Less(cfg.Peers[j].PublicKey)
-	})
-	return cfg, nil
-}
-
 // ReconfigDevice replaces the existing device configuration with cfg.
+//
+// Instead of using the UAPI text protocol, it uses the wireguard-go direct API
+// to install a PeerLookupFunc callback that creates peers on demand.
+//
+// The caller is responsible for:
+//   - calling Device.SetPrivateKey when the key changes
+//   - installing a PeerByIPPacketFunc on the device for outbound packet routing
+//     (e.g. via Engine.SetPeerByIPPacketFunc)
+//
+// Race note: there's a small TOCTOU window between RemoveMatchingPeers and
+// SetPeerLookupFunc where the previously-installed PeerLookupFunc (with a
+// stale peer set) is still active. A concurrent handshake for a peer that's
+// being removed could lazily recreate it via the old callback. Additionally,
+// wireguard-go's LookupPeer snapshots the lookupFunc reference inside its
+// RLock and then invokes it without the lock, so even reordering these calls
+// can't fully close the window. We accept this: lazily-created peers have
+// deleteOnIdle=true and self-clean after the rekey timeout (~9 min idle), so
+// the worst case is a brief excess of memory. Closing the race fully would
+// require either holding wireguard-go's peers lock across the lookupFunc
+// call or more elaborate locking, neither of which seems worth the
+// complexity for a transient memory blip.
 func ReconfigDevice(d *device.Device, cfg *Config, logf logger.Logf) (err error) {
 	defer func() {
 		if err != nil {
@@ -49,20 +49,44 @@ func ReconfigDevice(d *device.Device, cfg *Config, logf logger.Logf) (err error)
 		}
 	}()
 
-	prev, err := DeviceConfig(d)
-	if err != nil {
-		return err
+	// Build peer map: public key → allowed IPs.
+	peers := make(map[device.NoisePublicKey][]netip.Prefix, len(cfg.Peers))
+	for _, p := range cfg.Peers {
+		peers[p.PublicKey.Raw32()] = p.AllowedIPs
 	}
 
-	r, w := io.Pipe()
-	errc := make(chan error, 1)
-	go func() {
-		errc <- d.IpcSetOperation(r)
-		r.Close()
-	}()
+	// Remove peers not in the new config.
+	d.RemoveMatchingPeers(func(pk device.NoisePublicKey) bool {
+		_, exists := peers[pk]
+		return !exists
+	})
 
-	toErr := cfg.ToUAPI(logf, w, prev)
-	w.Close()
-	setErr := <-errc
-	return errors.Join(setErr, toErr)
+	// Update AllowedIPs on any already-active peers whose config may have
+	// changed. Peers that don't exist yet will get the correct AllowedIPs
+	// from PeerLookupFunc when they are lazily created.
+	for pk, allowedIPs := range peers {
+		if peer, ok := d.LookupActivePeer(pk); ok {
+			peer.SetAllowedIPs(allowedIPs)
+		}
+	}
+
+	// Install callback for lazy peer creation (incoming packets).
+	bind := d.Bind()
+	d.SetPeerLookupFunc(func(pubk device.NoisePublicKey) (_ *device.NewPeerConfig, ok bool) {
+		allowedIPs, ok := peers[pubk]
+		if !ok {
+			return nil, false
+		}
+		ep, err := bind.ParseEndpoint(fmt.Sprintf("%x", pubk[:]))
+		if err != nil {
+			logf("wgcfg: failed to parse endpoint for peer %x: %v", pubk[:8], err)
+			return nil, false
+		}
+		return &device.NewPeerConfig{
+			AllowedIPs: allowedIPs,
+			Endpoint:   ep,
+		}, true
+	})
+
+	return nil
 }
